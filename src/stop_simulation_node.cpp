@@ -38,6 +38,8 @@ private:
   ros::Subscriber sub_goal_;
   ros::Subscriber reconfig_goal_;
   ros::Subscriber rosout_sub_;
+  ros::Publisher pub_diagnostics_;
+
 public:
   LogData(std::ofstream& log_file,
           const ros::NodeHandle &node_handle,
@@ -62,8 +64,10 @@ public:
   int goal_counter_;
   int reconfig_counter_;
   int goal_failed_counter_;
-  bool goal_rached_;
+  bool goal_reached_;
+  bool goal_successful_;
   bool increase_power_;
+  bool send_laser_error_;
   float increase_power_factor_;
   ros::Time init_time_;
   ros::Time reconfig_init_time_;
@@ -76,23 +80,24 @@ public:
   int safety_under_threshold_;
   double energy_threshold_;
   double safety_threshold_;
+  double average_safety_;
+  int safety_over_zero_count_;
+  std::string av_cpu_load_;
+  std::string memory_used_;
 
   std::string errors_from_reasoner_;
-
-
-
-
 
   void robot_pose_callback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg_rob_pose);
   void power_load_callback(const std_msgs::Float32::ConstPtr& msg_power_load);
   void odom_callback(const nav_msgs::Odometry::ConstPtr& msg_odom);
   void imu_data_callback(const sensor_msgs::Imu::ConstPtr& msg_imu);
-  void safety_distance_callback(const std_msgs::Float32::ConstPtr& msg_safet_distance);
+  void safety_distance_callback(const std_msgs::Float32::ConstPtr& msg_safety_distance);
   void diagnostics_callback(const diagnostic_msgs::DiagnosticArray::ConstPtr& msg_diagnostics);
   void goal_result_callback(const move_base_msgs::MoveBaseActionResult::ConstPtr& msg_goal_result);
   void goal_callback(const move_base_msgs::MoveBaseActionGoal::ConstPtr& msg_goal);
   void reconfig_callback(const metacontrol_msgs::MvpReconfigurationActionGoal::ConstPtr& reconfig_goal);
   void rosout_callback(const rosgraph_msgs::Log::ConstPtr& rosout_msg);
+  void publish_error_laser();
 
   // Stops simulation by killing a required node
   void stop_simulation();
@@ -128,14 +133,18 @@ linear_accel_x_(0),
 power_load_(0),
 max_run_time_(500),
 elapsed_time_(0),
-goal_rached_(false),
+goal_reached_(false),
+goal_successful_(false),
 increase_power_(false),
+send_laser_error_(false),
 increase_power_factor_(0.0),
 safety_under_threshold_(0),
 energy_under_threshold_(0),
 safety_over_threshold_(0),
 reconfig_time_(0),
-energy_over_threshold_(0)
+energy_over_threshold_(0),
+safety_over_zero_count_(1),
+average_safety_(0)
 {
 
   std::string data_log_folder;
@@ -145,25 +154,32 @@ energy_over_threshold_(0)
   double max_run_time;
   double energy_threshold;
   double safety_threshold;
+  bool send_laser_error;
 
   log_data_file_ = std::ofstream();
 
   nh_private_.param("data_log_folder", data_log_folder, ros::package::getPath("metacontrol_experiments") + std::string("/data/"));
   nh_private_.param("store_data_freq", store_log_freq, 1.0);
   nh_private_.param("increase_power_factor", increase_power_factor, 0.0);
+  nh_private_.param("send_laser_error", send_laser_error, false);
   nh_private_.param("max_run_time", max_run_time, 500.0);
-  nh_.param("/nfr_energy", energy_threshold, 0.5);
-  nh_.param("/nfr_safety", safety_threshold, 0.8);
+  nh_private_.param("nfr_energy", energy_threshold, 0.5);
+  nh_private_.param("nfr_safety", safety_threshold, 0.8);
   nh_private_.param("max_run_time", max_run_time, 500.0);
 
-
-  if (increase_power_factor > 0)
+  if (send_laser_error)
+  {
+    ROS_INFO("[STOP SIM] Will send laser error message after 0.6 of the path is completed");
+    send_laser_error_ = true;
+  }
+  else if (increase_power_factor > 0)
   {
     ROS_INFO("[STOP SIM] Will increase power consumption by %.2f after 0.6 of the path is completed", increase_power_factor);
     increase_power_factor_ = increase_power_factor;
     increase_power_ = true;
   }
-
+  
+  
   max_run_time_ = max_run_time;
   energy_threshold_ = energy_threshold;
   safety_threshold_ = safety_threshold;
@@ -178,6 +194,7 @@ energy_over_threshold_(0)
   sub_goal_ = nh_.subscribe("/move_base/goal", 1, &LogData::goal_callback, this);
   reconfig_goal_ = nh_.subscribe("/rosgraph_manipulator_action_server/goal", 1, &LogData::reconfig_callback, this);
   rosout_sub_ = nh_.subscribe("/rosout", 1, &LogData::rosout_callback, this);
+  pub_diagnostics_ = nh_.advertise<diagnostic_msgs::DiagnosticArray>("/diagnostics", 1);
 
   data_log_filename_ = data_log_folder + "log_Metacontrol_sim_";
   data_log_filename_ = data_log_filename_ + get_date(false);
@@ -248,9 +265,9 @@ void LogData::imu_data_callback(const sensor_msgs::Imu::ConstPtr& msg_imu)
   linear_accel_x_ = msg_imu->linear_acceleration.x;
 }
 
-void LogData::LogData::safety_distance_callback(const std_msgs::Float32::ConstPtr& msg_safet_distance)
+void LogData::LogData::safety_distance_callback(const std_msgs::Float32::ConstPtr& msg_safety_distance)
 {
-  dist_to_obstacle_ = msg_safet_distance->data;
+  dist_to_obstacle_ = msg_safety_distance->data;
 }
 
 void LogData::diagnostics_callback(const diagnostic_msgs::DiagnosticArray::ConstPtr& msg_diagnostics)
@@ -260,7 +277,34 @@ void LogData::diagnostics_callback(const diagnostic_msgs::DiagnosticArray::Const
   {
     diagnostic_msgs::DiagnosticStatus tmp_diagnostic = msg_diagnostics->status[i];
 
-    if (tmp_diagnostic.message.compare(0, 2, "QA") == 0 )
+    if (tmp_diagnostic.name.compare("CPU Usage") == 0 )
+    {
+      // ROS_INFO("[LogData :: diagnostics_callback] - Message: %s", tmp_diagnostic.message.c_str());
+      if (tmp_diagnostic.values.size() > 1)
+      {
+        // if (tmp_diagnostic.values[1].key.compare("1 min Load Average") == 0)
+        // {
+            av_cpu_load_ = tmp_diagnostic.values[1].value;
+        // }
+      }
+    }
+    else if (tmp_diagnostic.name.compare("Memory Usage") == 0 )
+    {
+     // ROS_INFO("[LogData :: diagnostics_callback] - Message: %s", tmp_diagnostic.message.c_str());
+      if (tmp_diagnostic.values.size() > 1)
+      {
+        if (tmp_diagnostic.values[1].key.compare("Mem Used") == 0)
+        {
+            memory_used_ = tmp_diagnostic.values[1].value;
+        }
+      }
+    }
+    else if (tmp_diagnostic.name.compare(0, 2, "QA") == 0 )
+    {
+     // ROS_INFO("[LogData :: diagnostics_callback] - Message: %s", tmp_diagnostic.message.c_str());
+      updateQA(tmp_diagnostic);
+    }
+    else if (tmp_diagnostic.message.compare(0, 2, "QA") == 0 )
     {
      // ROS_INFO("[LogData :: diagnostics_callback] - Message: %s", tmp_diagnostic.message.c_str());
       updateQA(tmp_diagnostic);
@@ -286,11 +330,13 @@ void LogData::updateQA(const diagnostic_msgs::DiagnosticStatus diagnostic_status
   }
 }
 
+
 void LogData::goal_result_callback(const move_base_msgs::MoveBaseActionResult::ConstPtr& msg_goal_result)
 {
   if(msg_goal_result->status.status == 3)
   {
-    goal_rached_ = true;
+    goal_reached_ = true;
+    goal_successful_ = true;
   }
   else
   {
@@ -332,6 +378,26 @@ void LogData::stop_simulation()
 double LogData::goal_distance ()
 {
   return point_distance(rob_pos_, goal_pos_);
+}
+void LogData::publish_error_laser()
+{
+  diagnostic_msgs::DiagnosticArray diag_array;
+  diag_array.header.stamp = ros::Time::now();
+
+  diagnostic_msgs::DiagnosticStatus diag_state;
+  
+  diag_state.name = "error_laser";
+  diag_state.level = diagnostic_msgs::DiagnosticStatus::ERROR;
+  diag_state.message = "Component status";
+  diagnostic_msgs::KeyValue laser_error_key;
+  laser_error_key.key = "laser_resender";
+  laser_error_key.value = "FALSE";
+
+  diag_state.values.push_back(laser_error_key);
+  diag_array.status.push_back(diag_state);
+  diag_array.header.stamp = ros::Time::now();
+  pub_diagnostics_.publish(diag_array);
+
 }
 
 double LogData::point_distance (const geometry_msgs::Point point_1, const geometry_msgs::Point point_2)
@@ -382,7 +448,7 @@ bool LogData::open_log_file()
     }
     catch (std::ofstream::failure &writeErr)
     {
-        ROS_ERROR("Exception occured when writing to a file - %s", writeErr.what());
+        ROS_ERROR("Exception occurred when writing to a file - %s", writeErr.what());
         is_open = false;
     }
     return is_open;
@@ -406,13 +472,20 @@ bool LogData::write_log_header()
     log_data_file_ << "QA_error, ";
     log_data_file_ << "safety_over_threshold, ";
     log_data_file_ << "safety_under_threshold, ";
+    log_data_file_ << "percentage_above_safety, ";
     log_data_file_ << "energy_over_threshold, ";
     log_data_file_ << "energy_under_threshold, ";
+    log_data_file_ << "percentage_above_safety, ";
     log_data_file_ << "n_reconfigurations, ";
     log_data_file_ << "reconfig_time, ";
     log_data_file_ << "received_goals, ";
     log_data_file_ << "failed_goals, ";
     log_data_file_ << "run_time, ";
+    log_data_file_ << "goal_reached, ";
+    log_data_file_ << "QA_satisfied, ";
+    log_data_file_ << "Av_safety_satisfied, ";
+    log_data_file_ << "Average CPU Usage, ";
+    log_data_file_ << "Memory Compsumption, ";
     log_data_file_ << "reasoner_error_log";
     log_data_file_ << "\n";
     log_data_file_.close();
@@ -486,9 +559,22 @@ void LogData::store_info()
         energy_under_threshold_ += 1;
       }
 
+      double percentage_over_safety;
+      double percentage_over_energy;
+
+      percentage_over_safety = double(safety_over_threshold_) / double(safety_over_threshold_ + safety_under_threshold_);
+      percentage_over_energy = double(energy_over_threshold_) / double(energy_over_threshold_ + energy_under_threshold_);
+
+      if (safety_numeric > 0.0)
+      {
+        average_safety_ = average_safety_ + ((safety_numeric - average_safety_)/double(safety_over_zero_count_));
+        safety_over_zero_count_ ++;
+      }
+
       // under / over thr
       tmp_string.clear();
-      sprintf(buffer, "%d, %d, %d, %d, ", safety_over_threshold_, safety_under_threshold_, energy_over_threshold_, energy_under_threshold_);
+      sprintf(buffer, "%d, %d, %.2f, %d, %d, %.2f, ", safety_over_threshold_, safety_under_threshold_, percentage_over_safety, energy_over_threshold_, energy_under_threshold_, percentage_over_energy);
+
       tmp_string = buffer;
       log_data_file_ << tmp_string.c_str();
 
@@ -497,6 +583,30 @@ void LogData::store_info()
       tmp_string.clear();
       sprintf(buffer, "%d, %.3f, %d, %d, %.3f, ",reconfig_counter_, reconfig_time_, goal_counter_, goal_failed_counter_, elapsed_time_);
       tmp_string = buffer;
+      log_data_file_ << tmp_string.c_str();
+
+      // Whether or not the goal was reached
+      log_data_file_ <<  std::string(goal_successful_ ? "true," : "false,").c_str();
+      
+      // quality of the mission satisfied ?
+      // true only and only if (i) safety is above the safety violation less than 5% of the time
+      // (ii) energy is above the violation less than 10% of the time.
+
+      log_data_file_ << std::string((percentage_over_safety < 0.05 && percentage_over_energy < 0.1) ? "true," : "false,").c_str();
+
+      // average safety of the mission satisfied ?
+      // true only (i) safety average is below 0.4
+
+      // tmp_string.clear();
+      // sprintf(buffer, "%.2f, ", average_safety_);
+      // tmp_string = buffer;
+      // log_data_file_ << tmp_string.c_str();
+
+      log_data_file_ << std::string((average_safety_ < 0.6) ? "true," : "false,").c_str();
+
+      // Cpu ussage and memory compsumption
+      tmp_string.clear();
+      tmp_string = av_cpu_load_ + std::string(", ") + memory_used_ + std::string(", ");
       log_data_file_ << tmp_string.c_str();
 
       // Add error logs from reasoner
@@ -522,7 +632,7 @@ void LogData::timerCallback(const ros::TimerEvent& event)
   store_info();
   if (elapsed_time_ > max_run_time_)
   {
-    goal_rached_ = true;
+    goal_reached_ = true;
   }
 
 }
@@ -564,7 +674,7 @@ int main(int argc, char **argv){
 
   while (ros::ok())
   {
-    if (log_data.increase_power_)
+    if (log_data.increase_power_ || log_data.send_laser_error_)
     {
       double distance;
       distance = log_data.goal_distance ();
@@ -572,17 +682,26 @@ int main(int argc, char **argv){
       if (((first_distance - distance) / first_distance ) > 0.6)
       {
         ROS_INFO("[STOP SIM] - 2 / 3 of the route completed");
-        metacontrol_sim::IncreaseConsumptionFactor increase_srv;
-        increase_srv.request.increase_consumption = log_data.increase_power_factor_;
-        if (log_data.inc_power_client.call(increase_srv))
+        if (log_data.increase_power_factor_ > 0.0)
         {
-          ROS_INFO("Power consumption increased ");
+          metacontrol_sim::IncreaseConsumptionFactor increase_srv;
+          increase_srv.request.increase_consumption = log_data.increase_power_factor_;
+          if (log_data.inc_power_client.call(increase_srv))
+          {
+            ROS_INFO("Power consumption increased ");
+          }
+          else
+          {
+            ROS_WARN("Failed to call service /increase_power_consumption");
+          }
+          log_data.increase_power_ = false;
         }
-        else
+        else if (log_data.send_laser_error_)
         {
-          ROS_WARN("Failed to call service /increase_power_consumption");
+          log_data.publish_error_laser();
+          ROS_INFO("Error laser msg sent ");
+          log_data.send_laser_error_ = false;
         }
-        log_data.increase_power_ = false;
       }
     }
     if(log_data.elapsed_time_ >  240)
@@ -591,7 +710,7 @@ int main(int argc, char **argv){
       ROS_ERROR("240 seconds elapsed and no goal yet");
     }
 
-    if(log_data.goal_rached_)
+    if(log_data.goal_reached_)
     {
         log_data.store_info_timer_.stop();
         log_data.stop_simulation();
